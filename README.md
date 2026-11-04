@@ -23,6 +23,21 @@ It isn't on the Chrome Web Store yet, so load it unpacked:
 3. Click **Load unpacked** and choose the [`swarm-rebuild/`](swarm-rebuild) folder.
 4. Pin it (puzzle icon → pin).
 
+## Firefox / Zen
+
+A Firefox port lives in [`swarm-rebuild-firefox/`](swarm-rebuild-firefox). Download the signed `.xpi` from the
+[releases](https://github.com/zerobun0/swarm-cursors/releases) and drag it into the browser, or load the folder from
+`about:debugging`. Works in Firefox 128+ and Zen. Same shortcut: **Alt+Shift+S**.
+
+## Changes in this fork
+
+- Firefox/Zen build: `background.scripts` instead of a service worker, plus a gecko id
+- Rotated elements (tags, badges, stickers) keep their rotation and exact size instead of becoming flat boxes
+- Children clipped by a rounded `overflow: hidden` parent (card images, avatars) keep the rounded corners
+- The fixes also apply to the Chrome build in `swarm-rebuild/`
+
+The upstream repository has no license file; check with the original author before reusing the code.
+
 ## Use
 
 - Click the toolbar icon or press **Alt+Shift+S** on any page.

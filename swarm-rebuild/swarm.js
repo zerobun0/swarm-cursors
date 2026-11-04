@@ -69,7 +69,51 @@
     const t = Math.max(a.t, b.t);
     const r = Math.min(a.r, b.r);
     const bt = Math.min(a.b, b.b);
-    return r > l && bt > t ? { l, t, r, b: bt } : null;
+    if (!(r > l && bt > t)) return null;
+    const res = { l, t, r, b: bt };
+    // keep the rounded corners of whichever clip box this result still coincides with
+    const same = (o) => o.radN && Math.abs(o.l - l) < 0.5 && Math.abs(o.t - t) < 0.5 && Math.abs(o.r - r) < 0.5 && Math.abs(o.b - bt) < 0.5;
+    const src = same(b) ? b : same(a) ? a : null;
+    if (src) {
+      res.rad = src.rad;
+      res.radN = src.radN;
+    }
+    return res;
+  }
+
+  // Border radii of an overflow-clipping box, as the padding-box corners that clip its children.
+  // Returns CSS `round` radii (for clip-path: inset(... round ...)) plus per-corner numbers.
+  function cornerRadii(cs, w, h, bt, br, bb, bl) {
+    const px = (s, ref) => (s.endsWith("%") ? (parseFloat(s) / 100) * ref : parseFloat(s)) || 0;
+    const one = (prop, bwH, bwV) => {
+      const v = cs.getPropertyValue(prop).trim().split(/\s+/);
+      return [Math.max(0, px(v[0] || "0", w) - bwH), Math.max(0, px(v[1] || v[0] || "0", h) - bwV)];
+    };
+    let tl = one("border-top-left-radius", bl, bt);
+    let tr = one("border-top-right-radius", br, bt);
+    let rb = one("border-bottom-right-radius", br, bb);
+    let lb = one("border-bottom-left-radius", bl, bb);
+    const iw = w - bl - br;
+    const ih = h - bt - bb;
+    const f = Math.min(1, iw / Math.max(1e-6, tl[0] + tr[0]), iw / Math.max(1e-6, lb[0] + rb[0]), ih / Math.max(1e-6, tl[1] + lb[1]), ih / Math.max(1e-6, tr[1] + rb[1]));
+    if (f < 1) [tl, tr, rb, lb] = [tl, tr, rb, lb].map((c) => [c[0] * f, c[1] * f]);
+    if (![tl, tr, rb, lb].some((c) => c[0] > 0.5 || c[1] > 0.5)) return null;
+    const n = (v) => Math.round(v * 100) / 100;
+    return {
+      rad: `${n(tl[0])}px ${n(tr[0])}px ${n(rb[0])}px ${n(lb[0])}px / ${n(tl[1])}px ${n(tr[1])}px ${n(rb[1])}px ${n(lb[1])}px`,
+      radN: { tl, tr, br: rb, bl: lb },
+    };
+  }
+
+  // does an item's box reach into one of the clip box's rounded corners?
+  function touchesRoundCorner(r, c) {
+    const n = c.radN;
+    return (
+      (r.left < c.l + n.tl[0] && r.top < c.t + n.tl[1]) ||
+      (r.right > c.r - n.tr[0] && r.top < c.t + n.tr[1]) ||
+      (r.right > c.r - n.br[0] && r.bottom > c.b - n.br[1]) ||
+      (r.left < c.l + n.bl[0] && r.bottom > c.b - n.bl[1])
+    );
   }
 
   const ltrb = (r) => ({ l: r.left, t: r.top, r: r.right, b: r.bottom });
@@ -495,6 +539,8 @@
     const items = [];
     const roots = [];
     let order = 0;
+    // Rotation/skew of the element being walked (leaf elements only), applied to every item it emits.
+    let curXf = null;
     const csCache = new Map();
     const css = (el) => {
       let c = csCache.get(el);
@@ -519,9 +565,12 @@
         ? { x: r.left - ox + sx, y: r.top - oy + sy, w: r.width, h: r.height }
         : { x: r.left, y: r.top, w: r.width, h: r.height };
     const convClip = (c, layer) =>
-      layer === "world" ? { l: c.l - ox + sx, t: c.t - oy + sy, r: c.r - ox + sx, b: c.b - oy + sy } : { ...c };
+      layer === "world" ? { l: c.l - ox + sx, t: c.t - oy + sy, r: c.r - ox + sx, b: c.b - oy + sy, rad: c.rad, radN: c.radN } : { ...c };
     const clipFor = (r, clip, layer) => {
-      if (r.left >= clip.l - 0.5 && r.top >= clip.t - 0.5 && r.right <= clip.r + 0.5 && r.bottom <= clip.b + 0.5) return null;
+      if (r.left >= clip.l - 0.5 && r.top >= clip.t - 0.5 && r.right <= clip.r + 0.5 && r.bottom <= clip.b + 0.5) {
+        // fully inside the clip box: nothing to cut, unless it reaches into a rounded corner
+        if (!clip.radN || !touchesRoundCorner(r, clip)) return null;
+      }
       return convClip(clip, layer);
     };
     const inDoc = (b, layer) =>
@@ -529,7 +578,44 @@
         ? b.x + b.w > 0 && b.x < docW && b.y + b.h > 0 && b.y < docH
         : b.x + b.w > 0 && b.x < innerWidth && b.y + b.h > 0 && b.y < innerHeight;
 
+    // getBoundingClientRect() of a rotated/skewed element is the axis-aligned bounding box of the
+    // rotated shape. For leaf elements (no child boxes) rebuild the true layout box instead (same centre,
+    // offset size) and remember the matrix so the item is drawn rotated around its centre.
+    // A transformed parallelogram's bounding box is centred on the box's own centre, so this is exact.
+    function leafTransform(el, cs, r) {
+      if (cs.transform === "none" || !(el instanceof HTMLElement)) return null;
+      const mt = cs.transform.match(/^matrix\(([^)]+)\)$/);
+      if (!mt) return null;
+      const [a, b, c, d] = mt[1].split(",").map(Number);
+      if (![a, b, c, d].every(Number.isFinite)) return null;
+      if (Math.abs(b) < 1e-3 && Math.abs(c) < 1e-3) return null; // pure scale/translate: the bounding box is already right
+      if (!(el.children.length === 0 || allInline(el))) return null; // containers keep the old behaviour
+      let w0 = el.offsetWidth;
+      let h0 = el.offsetHeight;
+      if (!(w0 > 0 && h0 > 0)) return null;
+      // offset sizes are rounded to whole pixels, which can make text wrap; recover the exact fractional
+      // size from the bounding box instead:  W' = |a|w + |c|h,  H' = |b|w + |d|h
+      const A = Math.abs(a);
+      const B = Math.abs(b);
+      const C = Math.abs(c);
+      const D = Math.abs(d);
+      const det = A * D - C * B;
+      if (Math.abs(det) > 0.05) {
+        const sw = (D * r.width - C * r.height) / det;
+        const sh = (A * r.height - B * r.width) / det;
+        if (Math.abs(sw - w0) <= 1 && Math.abs(sh - h0) <= 1) {
+          w0 = sw;
+          h0 = sh;
+        }
+      }
+      const cx = (r.left + r.right) / 2;
+      const cy = (r.top + r.bottom) / 2;
+      const lr = { left: cx - w0 / 2, top: cy - h0 / 2, right: cx + w0 / 2, bottom: cy + h0 / 2, width: w0, height: h0 };
+      return { m: `matrix(${a},${b},${c},${d},0,0)`, r: lr };
+    }
+
     function add(it) {
+      if (curXf) it.xf = curXf;
       it.id = items.length;
       it.v = 1;
       it.rv = 0;
@@ -1016,6 +1102,15 @@
     }
 
     function walk(el, ctx, parent) {
+      const savedXf = curXf;
+      try {
+        walk0(el, ctx, parent);
+      } finally {
+        curXf = savedXf;
+      }
+    }
+
+    function walk0(el, ctx, parent) {
       if (items.length >= MAX_ITEMS) return;
       const tag = el.localName;
       if (SKIP.has(tag) || el === env.host) return;
@@ -1041,7 +1136,12 @@
       }
       const op = ctx.op * parseFloat(cs.opacity);
       if (!(op > 0.03)) return;
-      const r = el.getBoundingClientRect();
+      let r = el.getBoundingClientRect();
+      const xfm = leafTransform(el, cs, r);
+      if (xfm) {
+        r = xfm.r;
+        curXf = xfm.m;
+      }
       // "visually hidden" accessibility text: 1px boxes, clip:rect(0 0 0 0), clip-path:inset(50%)
       // (html/body overflow belongs to the viewport, so a 0px-tall body clips nothing)
       const clipsSelf = el !== html && el !== body && el !== env.scroller && cs.overflowX !== "visible" && cs.overflowY !== "visible";
@@ -1118,7 +1218,13 @@
         const bt = parseFloat(cs.borderTopWidth) || 0;
         const br = parseFloat(cs.borderRightWidth) || 0;
         const bb = parseFloat(cs.borderBottomWidth) || 0;
-        kidClip = intersect(clip, { l: r.left + bl, t: r.top + bt, r: r.right - br, b: r.bottom - bb });
+        const kidBox = { l: r.left + bl, t: r.top + bt, r: r.right - br, b: r.bottom - bb };
+        const cr = cornerRadii(cs, r.width, r.height, bt, br, bb, bl);
+        if (cr) {
+          kidBox.rad = cr.rad;
+          kidBox.radN = cr.radN;
+        }
+        kidClip = intersect(clip, kidBox);
         if (!kidClip) {
           node.end = items.length;
           return;
@@ -1834,13 +1940,14 @@
       const w = it.draw ? it.draw.w : it.w;
       const h = it.draw ? it.draw.h : it.h;
       let tf = `translate(${it.x + it.dx}px,${it.y + it.dy}px)`;
+      if (it.xf) tf += ` translate(${w / 2}px,${h / 2}px) ${it.xf} translate(${-w / 2}px,${-h / 2}px)`; // rotate about the item's centre
       if (it.scale !== 1) tf += ` scale(${it.scale})`;
       n.style.transform = tf;
       n.style.width = w + "px";
       n.style.height = h + "px";
       const c = it.clip;
       n.style.clipPath =
-        it.done && c ? `inset(${Math.max(0, c.t - it.y)}px ${Math.max(0, it.x + it.w - c.r)}px ${Math.max(0, it.y + it.h - c.b)}px ${Math.max(0, c.l - it.x)}px)` : "";
+        it.done && c ? `inset(${Math.max(0, c.t - it.y)}px ${Math.max(0, it.x + it.w - c.r)}px ${Math.max(0, it.y + it.h - c.b)}px ${Math.max(0, c.l - it.x)}px${c.rad ? " round " + c.rad : ""})` : "";
 
       if (it.kind === "rect") {
         const css = it.mode === "master" ? it.copyOf.css : it.css;
